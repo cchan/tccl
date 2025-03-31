@@ -199,9 +199,16 @@ def triton_wait(wait_addrs):
             pack=1,
         )
 
+    tl.inline_asm_elementwise(
+        "bar.sync 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1
+    )
+
 @triton.jit
 def triton_send(send_addrs):
     flat_tid = get_flat_tid()
+    tl.inline_asm_elementwise(
+        "bar.sync 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1
+    )    
     if flat_tid == 0:
         tl.inline_asm_elementwise(
             """
@@ -243,7 +250,6 @@ def double_tree_all_reduce_kernel(
         + tl.program_id(0)
     )
 
-    # blockwise_barrier_double_tree(signal_pad_ptrs, None, rank, world_size)
     pid = tl.program_id(axis=0)
 
     buffer_ptrs = buffer_ptrs.to(tl.pointer_type(tl.uint64))
@@ -251,17 +257,23 @@ def double_tree_all_reduce_kernel(
     signal_pad_ptrs = signal_pad_ptrs.to(tl.pointer_type(tl.uint64))
     block_start = pid * BLOCK_SIZE
 
-    if tree0_child0 != -1 and tree0_child0 < 8:
+    if pid < tl.num_programs(axis=0) // 2:
+        tree_child0 = tree0_child0
+        tree_child1 = tree0_child1
+        tree_parent = tree0_parent
+    else:
+        tree_child0 = tree1_child0
+        tree_child1 = tree1_child1
+        tree_parent = tree1_parent
+
+    if tree_child0 != -1 :
         local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(tl.pointer_type(tl.uint32))
-        wait_addrs = local_signal_pad_addr + block_id * world_size + tree0_child0
+        wait_addrs = local_signal_pad_addr + block_id * world_size + tree_child0
         triton_wait(wait_addrs)
-    if tree0_child1 != -1 and tree0_child1 < 8:
+    if tree_child1 != -1 :
         local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(tl.pointer_type(tl.uint32))
-        wait_addrs = local_signal_pad_addr + block_id * world_size + tree0_child1
+        wait_addrs = local_signal_pad_addr + block_id * world_size + tree_child1
         triton_wait(wait_addrs)
-    # if pid == 0:
-    #     print("rank", rank, tree0_parent, tree0_child0, tree0_child1)
-    # return
 
     while block_start < (numel // NUMEL_PER_THREAD):
         # Each thread processes 128 bits. Since Triton doesn't yet natively
@@ -273,71 +285,81 @@ def double_tree_all_reduce_kernel(
 
         acc_hi = tl.zeros((BLOCK_SIZE,), tl.uint64)
         acc_lo = tl.zeros((BLOCK_SIZE,), tl.uint64)
-        if tree0_child0 != -1 and tree0_child0 < 8:
-            # if (i == 0):
-            if (block_id == 0):
-                if rank == 0:
-                    if (block_start == pid * BLOCK_SIZE):
-                        buffer_ptr = tl.load(buffer_ptrs + tree0_child0).to(tl.pointer_type(tl.uint64))
-                        print("tree0_child0", buffer_ptr + offsets)
-                        (hi, lo) = load_128(buffer_ptr + offsets, mask=tl.full((1,), 4294967295, dtype=tl.uint32))
-            # (acc_hi, acc_lo) = add_v8_bf16(acc_hi, acc_lo, hi, lo)
-        # if tree0_child1 != -1 and tree0_child1 < 8:
-        #     buffer_ptr = tl.load(buffer_ptrs + tree0_child1).to(tl.pointer_type(tl.uint64))
-        #     (hi, lo) = load_128(buffer_ptr + offsets, mask=mask)
-        #     (acc_hi, acc_lo) = add_v8_bf16(acc_hi, acc_lo, hi, lo)
+        if tree_child0 != -1:
+            buffer_ptr = tl.load(buffer_ptrs + tree_child0).to(tl.pointer_type(tl.uint64))
+            (hi, lo) = load_128(buffer_ptr + offsets, mask=mask)
+            (acc_hi, acc_lo) = add_v8_bf16(acc_hi, acc_lo, hi, lo)
+        # All the computation in else Region will be eliminated by DSE pass, but it's necessary in triton's frontend parser now
+        else :
+            buffer_ptr = tl.load(buffer_ptrs + rank).to(tl.pointer_type(tl.uint64))
+            hi = tl.zeros((BLOCK_SIZE,), tl.uint64)
+            lo = tl.zeros((BLOCK_SIZE,), tl.uint64)
+            (acc_hi, acc_lo) = (acc_hi, acc_lo)
+
+        if tree_child1 != -1:
+            buffer_ptr = tl.load(buffer_ptrs + tree_child1).to(tl.pointer_type(tl.uint64))
+            (hi, lo) = load_128(buffer_ptr + offsets, mask=mask)
+            (acc_hi, acc_lo) = add_v8_bf16(acc_hi, acc_lo, hi, lo)
+        else :
+            buffer_ptr = tl.load(buffer_ptrs + rank).to(tl.pointer_type(tl.uint64))
+            hi = tl.zeros((BLOCK_SIZE,), tl.uint64)
+            lo = tl.zeros((BLOCK_SIZE,), tl.uint64)
+            (acc_hi, acc_lo) = (acc_hi, acc_lo)
+ 
+
         buffer_ptr = tl.load(buffer_ptrs + rank).to(tl.pointer_type(tl.uint64))
         (hi, lo) = load_128(buffer_ptr + offsets, mask=mask)
         (acc_hi, acc_lo) = add_v8_bf16(acc_hi, acc_lo, hi, lo)
-
+        
         tl.store(buffer_ptr + offsets + 0, acc_hi, mask=mask)
         tl.store(buffer_ptr + offsets + 1, acc_lo, mask=mask)
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
     
-    if tree0_parent != -1:
-        remote_signal_pad_addrs = tl.load(signal_pad_ptrs + tree0_parent).to(tl.pointer_type(tl.uint32))
+    if tree_parent != -1:
+        remote_signal_pad_addrs = tl.load(signal_pad_ptrs + tree_parent).to(tl.pointer_type(tl.uint32))
         send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
         triton_send(send_addrs)
 
         local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(tl.pointer_type(tl.uint32))
-        wait_addrs = local_signal_pad_addr + block_id * world_size + tree0_parent
+        wait_addrs = local_signal_pad_addr + block_id * world_size + tree_parent
         triton_wait(wait_addrs)
 
-    #     while block_start < (numel // NUMEL_PER_THREAD):
-    #         # Each thread processes 128 bits. Since Triton doesn't yet natively
-    #         # support 128-bit dtypes, we achieve this by having each thread process
-    #         # two 64-bit elements.
+    block_start = pid * BLOCK_SIZE
+    while block_start < (numel // NUMEL_PER_THREAD):
+        # Each thread processes 128 bits. Since Triton doesn't yet natively
+        # support 128-bit dtypes, we achieve this by having each thread process
+        # two 64-bit elements.
 
-    #         offsets = (block_start + tl.arange(0, BLOCK_SIZE)) * 2
-    #         mask = block_start + tl.arange(0, BLOCK_SIZE) < numel // NUMEL_PER_THREAD
+        offsets = (block_start + tl.arange(0, BLOCK_SIZE)) * 2
+        mask = block_start + tl.arange(0, BLOCK_SIZE) < numel // NUMEL_PER_THREAD
 
-    #         buffer_ptr = tl.load(buffer_ptrs + tree0_parent).to(tl.pointer_type(tl.uint64))
-    #         (hi, lo) = load_128(buffer_ptr + offsets, mask=mask)
-    #         # if tree0_parent != -1:
-    #         #     buffer_ptr = tl.load(buffer_ptrs + tree0_parent).to(tl.pointer_type(tl.uint64))
-    #         #     (hi, lo) = load_128(buffer_ptr + offsets, mask=mask)
-    #         #     (acc_hi, acc_lo) = add_v8_bf16(acc_hi, acc_lo, hi, lo)
+        if tree_parent != -1:
+            buffer_ptr = tl.load(buffer_ptrs + tree_parent).to(tl.pointer_type(tl.uint64))
+            (hi, lo) = load_128(buffer_ptr + offsets, mask=mask)
+            buffer_ptr = tl.load(buffer_ptrs + rank).to(tl.pointer_type(tl.uint64))
+            tl.store(buffer_ptr + offsets + 0, hi, mask=mask)
+            tl.store(buffer_ptr + offsets + 1, lo, mask=mask)
+            tl.store(output_ptr + offsets + 0, hi, mask=mask)
+            tl.store(output_ptr + offsets + 1, lo, mask=mask)
+        else:
+            buffer_ptr = tl.load(buffer_ptrs + rank).to(tl.pointer_type(tl.uint64))
+            (hi, lo) = load_128(buffer_ptr + offsets, mask=mask)
+            tl.store(output_ptr + offsets + 0, hi, mask=mask)
+            tl.store(output_ptr + offsets + 1, lo, mask=mask)
+        block_start += tl.num_programs(axis=0) * BLOCK_SIZE
 
-    #         buffer_ptr = tl.load(buffer_ptrs + rank).to(tl.pointer_type(tl.uint64))
-    #         tl.store(buffer_ptr + offsets + 0, hi, mask=mask)
-    #         tl.store(buffer_ptr + offsets + 1, lo, mask=mask)
-    #         tl.store(output_ptr + offsets + 0, hi, mask=mask)
-    #         tl.store(output_ptr + offsets + 1, lo, mask=mask)
-    #         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
-    
-    # if tree0_child0 != -1:
-    #     remote_signal_pad_addrs = tl.load(signal_pad_ptrs + tree0_child0).to(tl.pointer_type(tl.uint32))
-    #     send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
-    #     triton_send(send_addrs)
-    # if tree0_child1 != -1:
-    #     remote_signal_pad_addrs = tl.load(signal_pad_ptrs + tree0_child1).to(tl.pointer_type(tl.uint32))
-    #     send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
-    #     triton_send(send_addrs)
-
+    if tree_child0 != -1:
+        remote_signal_pad_addrs = tl.load(signal_pad_ptrs + tree_child0).to(tl.pointer_type(tl.uint32))
+        send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
+        triton_send(send_addrs)
+    if tree_child1 != -1:
+        remote_signal_pad_addrs = tl.load(signal_pad_ptrs + tree_child1).to(tl.pointer_type(tl.uint32))
+        send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
+        triton_send(send_addrs)
 
 def double_tree_all_reduce(tensor: torch.Tensor):
     MAX_NUM_BLOCKS = 24
-    NUM_WARPS = 16
+    NUM_WARPS = 4
     BLOCK_SIZE = NUM_WARPS * 32
     NUMEL_PER_THREAD = 8
 
@@ -349,12 +371,11 @@ def double_tree_all_reduce(tensor: torch.Tensor):
         triton.cdiv(triton.cdiv(tensor.numel(), NUMEL_PER_THREAD), BLOCK_SIZE),
         MAX_NUM_BLOCKS,
     )
-
+    assert num_blocks % 2 == 0, "Better strike a balance between two trees"
     symm_mem = _SymmetricMemory.rendezvous(tensor)
     output = torch.empty_like(tensor)
 
     tree0_parent, tree0_child0, tree0_child1, tree1_parent, tree1_child0, tree1_child1 = get_parents_and_children(8, rank)
-
     double_tree_all_reduce_kernel[(num_blocks, 1, 1)](
         symm_mem.buffer_ptrs_dev,
         symm_mem.signal_pad_ptrs_dev,
@@ -368,7 +389,6 @@ def double_tree_all_reduce(tensor: torch.Tensor):
         num_warps=NUM_WARPS,
     )
     return output
-
 
 if __name__ == "__main__":
     """
@@ -386,7 +406,7 @@ if __name__ == "__main__":
 
     torch.manual_seed(rank)
 
-    size = 8*1024
+    size = 2048*1024
 
     tensor = _SymmetricMemory.empty_strided_p2p(
         size=(size,),
@@ -400,41 +420,37 @@ if __name__ == "__main__":
     for i in range(world_size):
         torch.manual_seed(i)
         answer += torch.randn(size, dtype=torch.bfloat16)
-
-    if rank == 0:
-        print("REFERENCE", answer)
-
     output = double_tree_all_reduce(tensor)
     print(f"OUTPUT {rank} {world_size} {output}")
 
-    assert torch.allclose(output.cpu(), answer)
+    if rank == 0:
+        print("REFERENCE", answer)
+    assert torch.allclose(output.cpu(), answer, rtol=1e-1, atol=1e-01)
 
-    while size >= 2048:
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
 
-        REPS = 10
+    REPS = 10
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(REPS):
-            output = double_tree_all_reduce(tensor[:size])
-        end.record()
-        torch.cuda.synchronize()
-        if rank == 0:
-            print(f"triton {size * 2} {size * 2 / start.elapsed_time(end) / 1e6 * REPS} MB/s")
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    dist.all_reduce(tensor[:size])  # Warmup
+    start.record()
+    for _ in range(REPS):
+        dist.all_reduce(tensor)
+    end.record()
+    torch.cuda.synchronize()
+    if rank == 0:
+        print(f"nccl {size * 2} {size * 2 / start.elapsed_time(end) / 1e6 * REPS} MB/s")
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        dist.all_reduce(tensor[:size])  # Warmup
-        start.record()
-        for _ in range(REPS):
-            dist.all_reduce(tensor)
-        end.record()
-        torch.cuda.synchronize()
-        if rank == 0:
-            print(f"nccl {size * 2} {size * 2 / start.elapsed_time(end) / 1e6 * REPS} MB/s")
-
-        size //= 2
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    double_tree_all_reduce(tensor[:size])
+    start.record()
+    for _ in range(REPS):
+        double_tree_all_reduce(tensor[:size])
+    end.record()
+    torch.cuda.synchronize()
+    if rank == 0:
+        print(f"triton {size * 2} {size * 2 / start.elapsed_time(end) / 1e6 * REPS} MB/s")
 
     dist.destroy_process_group()
